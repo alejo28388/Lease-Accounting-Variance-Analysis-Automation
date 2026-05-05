@@ -1,2 +1,207 @@
 # Lease-Accounting-Variance-Analysis-Automation
 Python-based automation project that extracts lease accounting data from SAP (FBL3N), cleans and transforms datasets, and identifies discrepancies in liability accounts. The solution focuses on detecting incorrect transaction types and non-zero balances to improve reconciliation efficiency and financial data accuracy.
+
+
+import numpy as np
+import pandas as pd
+import smtplib
+#from email.message import EmailMessage
+import win32com.client
+import subprocess
+import time
+#import getpass as get
+import os as os
+
+# 1) Abrir SAP Logon
+subprocess.Popen(r"C:\Program Files (x86)\SAP\FrontEnd\SAPgui\saplogon.exe")
+
+time.sleep(5)
+
+SapGuiAuto = win32com.client.GetObject("SAPGUI")
+application = SapGuiAuto.GetScriptingEngine
+
+connection = application.OpenConnection("PRD - ECC Production", True)
+
+session = connection.Children(0)
+
+# Usuario
+#usuario = input("Usuario SAP: ")
+session.findById("wnd[0]/usr/txtRSYST-BNAME").text = usuario
+
+# Password
+#password = get.getpass("Password SAP: ")
+session.findById("wnd[0]/usr/pwdRSYST-BCODE").text = password
+
+# Cliente
+session.findById("wnd[0]/usr/txtRSYST-MANDT").text = "900"
+
+# Lenguaje
+session.findById("wnd[0]/usr/txtRSYST-LANGU").text = "EN"
+
+# Presionar Enter
+session.findById("wnd[0]").sendVKey(0)
+
+# 2) entrar a un T-code (en este caso FBL3N)
+
+# ⚠️ Manejo de popup (muy común)
+
+try:
+    session.findById("wnd[1]/tbar[0]/btn[0]").press()
+except:
+    pass
+
+time.sleep(2)
+
+# ✅ Ir a FBL3N
+session.findById("wnd[0]/tbar[0]/okcd").text = "/nFBL3N"
+session.findById("wnd[0]").sendVKey(0)
+
+# 3) llenar los campos requeridos 
+
+# Company Code (Sociedad)
+
+time.sleep(3)
+
+# Abrir selección múltiple solo el campo accounts
+session.findById("wnd[0]/usr/btn%_SD_SAKNR_%_APP_%-VALU_PUSH").press()
+
+time.sleep(2)
+
+input("Presiona ENTER aquí cuando hayas terminado en SAP...")
+
+# Ejecutar (F8)
+session.findById("wnd[0]").sendVKey(8)
+
+# 4) exportar los datos del T-code en este caso la FBL3N
+
+ruta = r"C:\Users\acanolop\Desktop"
+archivo = "NA_check_dataset.xlsx"
+
+# Crear carpeta si no existe
+os.makedirs(ruta, exist_ok=True)
+
+time.sleep(5)
+
+# Exportar
+session.findById("wnd[0]/mbar/menu[0]/menu[3]/menu[1]").select()
+time.sleep(2)
+
+session.findById("wnd[1]/tbar[0]/btn[0]").press()
+time.sleep(2)
+
+session.findById("wnd[1]/usr/ctxtDY_PATH").text = ruta
+session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = archivo
+
+session.findById("wnd[1]/tbar[0]/btn[11]").press()
+
+print("✅ Archivo exportado correctamente:", ruta + archivo)
+
+"--------------------------------------------------------------------------------------------------------------------"
+
+Data_set = (r'C:\Users\acanolop\Desktop')
+df_NA_data = pd.read_excel(Data_set, index_col=0, engine='openpyxl', keep_default_na=False)
+
+columns_to_drop = [
+    "Clearing Document",
+    "Trading partner",
+    "Cost Center",
+    "Functional Area"
+]
+
+df_NA_data = df_NA_data.drop(columns=columns_to_drop,errors= 'ignore')
+
+# Normalizar columna FTyp
+df_NA_data["Flow Type"] = (
+    df_NA_data["Flow Type"]
+    .astype(str)
+    .str.strip()
+    .str.upper()
+)
+
+# Debug (ahora sí se verá NA)
+#print("Valores en FTyp:")
+#print(df_NA_data["FTyp"].value_counts())
+
+df_NA_data = df_NA_data[df_NA_data["Flow Type"] == "NA"]
+
+#print(f"\nFilas totales: {df_NA_data.shape[0]}")
+#print(f"Filas NA: {df_NA_data.shape[0]}")
+#print(df_NA_data)
+
+#asegurar que la columna "LC amnt" tenga datos numericos
+df_NA_data["Amount in local currency"] = (
+    pd.to_numeric(df_NA_data["Amount in local currency"], errors="coerce")
+    .fillna(0)
+)
+
+#Validar que la suma en la columna "LC amnt" sea igual a cero
+df_grouped = (
+    df_NA_data
+    .groupby(
+        ["Account", "Year/month"],
+        as_index=False
+    )
+    .agg(
+        total_lc_amount=("Amount in local currency", "sum")
+    )
+)
+
+# Validación global del balance
+total_balance = round(df_grouped["total_local_amount"].sum(), 2)
+
+if total_balance == 0:
+    global_status = "BALANCED"
+else:
+    global_status = "UNBALANCED"
+
+#Ver resultados
+print("\n===== RESUMEN POR CUENTA Y PERÍODO =====")
+print(df_grouped)
+
+print("\n===== VALIDACIÓN GLOBAL =====")
+print(f"STATUS: {global_status}")
+print(f"Total Local amount: {total_balance}")
+
+# GroupBy por Profit Ctr
+df_by_profit_ctr = (
+    df_NA_data
+    .groupby("Profit Center", as_index=False)
+    .agg(
+        total_local_amount=("Amount in local currency", "sum")
+    )
+)
+
+# Profit Ctr desbalanceados
+df_unbalanced_profit_ctr = df_by_profit_ctr[
+    df_by_profit_ctr["total_local_amount"].round(2) != 0
+]
+
+print("\n===== PROFIT CTR DESBALANCEADOS =====")
+print(df_unbalanced_profit_ctr)
+
+# Traer registros solo de esos Profit Ctr
+df_problem_records = df_NA_data.merge(
+    df_unbalanced_profit_ctr[["Profit Center"]],
+    on="Profit Center",
+    how="inner"
+)
+
+# Impacto por usuario
+df_user_impact = (
+    df_problem_records
+    .groupby(
+        ["Profit Center", "Document Number", "User Name"],
+        as_index=False
+    )
+    .agg(
+        user_lc_amount=("Amount in local currency", "sum")
+    )
+)
+
+# Mostrar solo usuarios con impacto real
+df_user_impact = df_user_impact[
+    df_user_impact["user_local_amount"].round(2) != 0
+]
+
+print("\n===== IMPACTO POR USUARIO =====")
+print(df_user_impact)
